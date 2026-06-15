@@ -1,0 +1,6 @@
+/gorel
+*.test
+*.out
+.idea/
+.vscode/
+.DS_Store
