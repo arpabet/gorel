@@ -144,4 +144,4 @@ Use `--no-push` to create the commit and tags locally and push them yourself.
 
 ## License
 
-Business Source License 1.1 (BUSL-1.1) — Copyright (c) 2026 Karagatan LLC.
+Apache License 2.0 (Apache-2.0) — Copyright (c) 2026 Karagatan LLC.

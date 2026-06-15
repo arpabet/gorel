@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Karagatan LLC.
- * SPDX-License-Identifier: BUSL-1.1
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // Command gorel tags coordinated releases for go.arpabet.com-style multi-module
