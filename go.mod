@@ -1,10 +1,10 @@
 module go.arpabet.com/gorel
 
-go 1.23.0
+go 1.25.0
 
 require (
 	go.arpabet.com/cligo v0.3.0
-	golang.org/x/mod v0.21.0
+	golang.org/x/mod v0.37.0
 )
 
 require (
