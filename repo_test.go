@@ -5,7 +5,51 @@
 
 package main
 
-import "testing"
+import (
+	"testing"
+)
+
+func TestTopoSort(t *testing.T) {
+	// obfs: reality requires tlscamo; root and webrtc are independent.
+	mods := []Module{
+		{Key: "."},
+		{Key: "reality", Deps: []string{"tlscamo"}},
+		{Key: "tlscamo"},
+		{Key: "webrtc"},
+	}
+	ordered, err := topoSort(mods)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := map[string]int{}
+	for i, m := range ordered {
+		pos[m.Key] = i
+	}
+	if len(ordered) != len(mods) {
+		t.Fatalf("got %d modules, want %d", len(ordered), len(mods))
+	}
+	if pos["tlscamo"] > pos["reality"] {
+		t.Errorf("tlscamo (dependency) must come before reality: %v", keys(ordered))
+	}
+}
+
+func TestTopoSortCycle(t *testing.T) {
+	mods := []Module{
+		{Key: "a", Deps: []string{"b"}},
+		{Key: "b", Deps: []string{"a"}},
+	}
+	if _, err := topoSort(mods); err == nil {
+		t.Error("expected a dependency-cycle error")
+	}
+}
+
+func keys(mods []Module) []string {
+	out := make([]string, len(mods))
+	for i, m := range mods {
+		out[i] = m.Key
+	}
+	return out
+}
 
 func TestDerivePrefix(t *testing.T) {
 	cases := []struct{ key, path, want string }{

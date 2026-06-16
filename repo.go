@@ -21,9 +21,10 @@ import (
 
 // Module is one releasable Go module in the repository.
 type Module struct {
-	Key  string // "." for the root module, else the subdir, e.g. "grpc" or "providers/badger"
-	Dir  string // filesystem directory relative to the repo root
-	Path string // module import path, e.g. go.arpabet.com/servion/grpc
+	Key  string   // "." for the root module, else the subdir, e.g. "grpc" or "providers/badger"
+	Dir  string   // filesystem directory relative to the repo root
+	Path string   // module import path, e.g. go.arpabet.com/servion/grpc
+	Deps []string // keys of other in-repo modules this one requires (sorted)
 }
 
 // Tag returns the git tag for this module at version v: "vX.Y.Z" for the root
@@ -81,16 +82,79 @@ func discoverModules(root string) (prefix string, mods []Module, err error) {
 	}
 	sort.Strings(keys) // "." sorts before any subdir, so the root comes first
 
-	for _, k := range keys {
-		mp, mErr := modulePath(filepath.Join(root, k, "go.mod"))
+	// First pass: read each module's path and its require list.
+	reqs := make([][]string, len(keys))
+	for i, k := range keys {
+		mp, rqs, mErr := parseModule(filepath.Join(root, k, "go.mod"))
 		if mErr != nil {
 			return "", nil, mErr
 		}
 		mods = append(mods, Module{Key: k, Dir: k, Path: mp})
+		reqs[i] = rqs
+	}
+
+	// Second pass: resolve which requires point at other modules in this repo,
+	// recording the intra-repo dependency edges (dependent -> dependency keys).
+	pathToKey := make(map[string]string, len(mods))
+	for _, m := range mods {
+		pathToKey[m.Path] = m.Key
+	}
+	for i := range mods {
+		for _, rp := range reqs[i] {
+			if depKey, ok := pathToKey[rp]; ok && depKey != mods[i].Key {
+				mods[i].Deps = append(mods[i].Deps, depKey)
+			}
+		}
+		sort.Strings(mods[i].Deps)
 	}
 
 	prefix = derivePrefix(mods[0].Key, mods[0].Path)
 	return prefix, mods, nil
+}
+
+// topoSort orders modules so every module appears after all of its in-repo
+// dependencies — the order a coordinated release must follow so each dependency
+// is tagged (and, online, pushed) before any module that requires it. The input
+// order is preserved among independent modules, keeping output deterministic.
+// It errors on a dependency cycle.
+func topoSort(mods []Module) ([]Module, error) {
+	byKey := make(map[string]Module, len(mods))
+	for _, m := range mods {
+		byKey[m.Key] = m
+	}
+	const (
+		unvisited = 0
+		visiting  = 1
+		done      = 2
+	)
+	state := make(map[string]int, len(mods))
+	var order []Module
+	var visit func(m Module) error
+	visit = func(m Module) error {
+		switch state[m.Key] {
+		case done:
+			return nil
+		case visiting:
+			return fmt.Errorf("dependency cycle involving module %q", m.Key)
+		}
+		state[m.Key] = visiting
+		for _, dk := range m.Deps { // Deps is sorted, so traversal is deterministic
+			if dm, ok := byKey[dk]; ok {
+				if err := visit(dm); err != nil {
+					return err
+				}
+			}
+		}
+		state[m.Key] = done
+		order = append(order, m)
+		return nil
+	}
+	for _, m := range mods {
+		if err := visit(m); err != nil {
+			return nil, err
+		}
+	}
+	return order, nil
 }
 
 // derivePrefix returns the repo's shared module namespace from the first module:
@@ -102,19 +166,24 @@ func derivePrefix(firstKey, firstPath string) string {
 	return strings.TrimSuffix(firstPath, "/"+firstKey)
 }
 
-func modulePath(goMod string) (string, error) {
+// parseModule reads a go.mod and returns its module path and the import paths of
+// every require directive (used to discover intra-repo dependency edges).
+func parseModule(goMod string) (path string, requires []string, err error) {
 	data, err := os.ReadFile(goMod)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	f, err := modfile.Parse(goMod, data, nil)
 	if err != nil {
-		return "", fmt.Errorf("parse %s: %w", goMod, err)
+		return "", nil, fmt.Errorf("parse %s: %w", goMod, err)
 	}
 	if f.Module == nil {
-		return "", fmt.Errorf("%s has no module directive", goMod)
+		return "", nil, fmt.Errorf("%s has no module directive", goMod)
 	}
-	return f.Module.Mod.Path, nil
+	for _, r := range f.Require {
+		requires = append(requires, r.Mod.Path)
+	}
+	return f.Module.Mod.Path, requires, nil
 }
 
 // rewriteGoMod strips bootstrap replace directives that point at internal modules
