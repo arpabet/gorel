@@ -50,13 +50,18 @@ func (c *RepairCmd) Run(ctx context.Context) error {
 	}
 	cligo.Echo("module prefix: %s", prefix)
 
+	pathToKey := make(map[string]string, len(mods))
+	for _, m := range mods {
+		pathToKey[m.Path] = m.Key
+	}
+
 	// -mod=mod lets tidy rewrite go.mod/go.sum; GOWORK=off (added by goCmd) keeps a
 	// stray go.work from substituting local, possibly-stale module copies.
 	env := []string{"GOFLAGS=-mod=mod"}
 
 	changedAny := false
 	for _, m := range mods {
-		changed, err := repairModule(m, env, c.DryRun)
+		changed, err := repairModule(m, pathToKey, env, c.DryRun)
 		if err != nil {
 			return err
 		}
@@ -87,7 +92,7 @@ func (c *RepairCmd) Run(ctx context.Context) error {
 // reporting whether anything changed. In dry-run it tidies for real (the only way
 // to know the outcome) then restores the original go.mod/go.sum so nothing
 // persists.
-func repairModule(m Module, env []string, dryRun bool) (changed bool, err error) {
+func repairModule(m Module, pathToKey map[string]string, env []string, dryRun bool) (changed bool, err error) {
 	modPath := filepath.Join(m.Dir, "go.mod")
 	sumPath := filepath.Join(m.Dir, "go.sum")
 	modBefore, err := os.ReadFile(modPath)
@@ -97,6 +102,16 @@ func repairModule(m Module, env []string, dryRun bool) (changed bool, err error)
 	sumBefore, err := os.ReadFile(sumPath)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
+	}
+
+	// Re-fetch every in-repo dependency from the origin so tidy records the real
+	// published checksum even if go.sum or the module cache hold stale/poisoned bits.
+	deps, err := inRepoRequires(m.Dir, pathToKey)
+	if err != nil {
+		return false, err
+	}
+	for depPath, version := range deps {
+		freshenDep(m.Dir, depPath, version)
 	}
 
 	if err := tidyModule(m.Dir, env); err != nil {

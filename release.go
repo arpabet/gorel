@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"go.arpabet.com/cligo"
@@ -19,44 +18,41 @@ type ReleaseCmd struct {
 	Parent  cligo.CliGroup `cli:"group=cli"`
 	Version string         `cli:"argument=version"`
 	Bump    []string       `cli:"option=bump,short=-b,help=per-module version override module=version (repeatable)"`
-	DryRun  bool           `cli:"option=dry-run,help=print the plan, go.mod and go.sum changes, then exit"`
-	Offline bool           `cli:"option=offline,help=skip the go toolchain; compute go.sum hashes locally"`
+	DryRun  bool           `cli:"option=dry-run,help=print the phased release plan and exit"`
 }
 
 func (c *ReleaseCmd) Command() string { return "release" }
 
 func (c *ReleaseCmd) Help() (string, string) {
-	return "Tag a coordinated multi-module release.",
-		`Tags every module in the repository at VERSION (vX.Y.Z). The module prefix is
-auto-detected from go.mod, the root module is tagged "vX.Y.Z" and each submodule
-"<subdir>/vX.Y.Z". Internal require lines are pinned to the release version and
-local-dev replace directives are stripped before tagging.
+	return "Release one dependency phase of a coordinated multi-module release.",
+		`Tags every module in the repository at VERSION (vX.Y.Z), one dependency phase
+per run. A "phase" is the set of modules whose in-repo dependencies are already
+released; the root module is tagged "vX.Y.Z" and each submodule "<subdir>/vX.Y.Z".
 
-Modules are released in dependency order: a module that requires another module
-in this repo has its go.sum updated to record the dependency's released checksum
-before it is tagged.
+For the phase's modules gorel pins internal require lines to the release version,
+strips local-dev replace directives, then runs 'go mod tidy' and 'go build ./...'.
+The go.sum is therefore produced by the go toolchain pulling the already-published
+dependencies from the real module proxy — gorel computes no checksums itself, so the
+sums are exactly what consumers will verify. It then commits and tags locally.
 
-By default the go toolchain is authoritative: every releasing module is served to
-'go get'/'go mod tidy' from a temporary local proxy (so no tag needs to be pushed
-to resolve it), and each dependent is updated, built, and verified. With --offline
-the same go.sum hashes are computed locally without invoking the toolchain.
+Because each dependent's 'go mod tidy' fetches its dependency from the proxy, the
+dependency must be pushed before the next phase runs. So gorel works in phases:
 
-gorel never pushes: it creates the release commit and tags locally and prints the
-'git push' command to publish them. Pushing is the operator's action, on purpose.
+  1. run 'gorel release vX.Y.Z'   — releases the modules with no unreleased deps
+  2. push the branch and the tags it printed
+  3. run 'gorel release vX.Y.Z' again — releases the next phase, and so on
 
-Re-runs are safe: tags that already exist are skipped (so a newly added submodule
-can be tagged at an already-released shared version), and an empty release commit
-is tolerated.
+gorel never pushes: it tags locally and prints the exact 'git push' to publish each
+phase, plus the command to run the next one. Re-runs are safe — modules already
+tagged at the release version are skipped.
 
 EXAMPLES
-  gorel release v1.3.0                     release every module at v1.3.0
-  gorel release v1.3.0 -b grpc=v1.3.1      everything at v1.3.0, grpc at v1.3.1
-  gorel release v1.3.0 --dry-run           preview plan + go.mod/go.sum changes
-  gorel release v1.3.0 --offline           compute go.sum locally, no toolchain`
+  gorel release v1.3.0                  release the next ready phase
+  gorel release v1.3.0 -b grpc=v1.3.1   bump grpc to v1.3.1, the rest at v1.3.0
+  gorel release v1.3.0 --dry-run        print the full phase plan, change nothing`
 }
 
 func (c *ReleaseCmd) Run(ctx context.Context) error {
-
 	if err := validVersion(c.Version); err != nil {
 		return err
 	}
@@ -88,31 +84,17 @@ func (c *ReleaseCmd) Run(ctx context.Context) error {
 		return c.Version
 	}
 
-	// Release in dependency order so each dependency is tagged before any module
-	// that requires it.
+	// Order modules so every dependency precedes the modules that require it; this
+	// also rejects dependency cycles up front.
 	mods, err = topoSort(mods)
 	if err != nil {
 		return err
 	}
 
 	cligo.Echo("module prefix: %s", prefix)
-	cligo.Echo("Release plan (shared %s, dependency order):", c.Version)
-	for _, m := range mods {
-		t := m.Tag(verOf(m.Key))
-		suffix := ""
-		if len(m.Deps) > 0 {
-			suffix = "  (requires " + strings.Join(m.Deps, ", ") + ")"
-		}
-		if tagExists(t) {
-			cligo.Echo("  %-26s -> %s (exists, will skip)%s", m.Key, t, suffix)
-		} else {
-			cligo.Echo("  %-26s -> %s%s", m.Key, t, suffix)
-		}
-	}
-	cligo.Echo("")
 
 	if c.DryRun {
-		return c.dryRun(mods, prefix, pathToKey, keyToMod, verOf)
+		return c.planDryRun(mods, verOf)
 	}
 
 	clean, err := treeClean()
@@ -130,158 +112,199 @@ func (c *ReleaseCmd) Run(ctx context.Context) error {
 		cligo.Echo("warning: on branch %q, not 'main'", branch)
 	}
 
-	// Choose the go.sum strategy: the authoritative toolchain by default, local
-	// hashing when --offline or when the proxy is unreachable (external deps could
-	// not be resolved by 'go mod tidy' anyway).
-	offline := c.Offline
-	if !offline && !proxyReachable() {
-		cligo.Echo("warning: module proxy unreachable; computing go.sum locally (offline)")
-		offline = true
+	ready, pending := splitReady(mods, verOf)
+	if len(ready) == 0 {
+		cligo.Echo("every module is already tagged at its release version — nothing to do.")
+		return nil
 	}
 
-	if offline {
-		return c.releaseOffline(mods, prefix, pathToKey, keyToMod, verOf, branch)
-	}
-	return c.releaseOnline(mods, prefix, pathToKey, keyToMod, verOf, branch)
-}
+	cligo.Echo("Phase: %s", keysOf(ready))
 
-// dryRun prints the go.mod and go.sum changes the release would make, without
-// touching anything. go.sum hashes are computed locally (Strategy B) and are
-// exact for leaf dependencies; a dependency that is itself re-pinned shifts its
-// own hash, noted inline.
-func (c *ReleaseCmd) dryRun(mods []Module, prefix string, pathToKey map[string]string, keyToMod map[string]Module, verOf func(string) string) error {
-	cligo.Echo("go.mod changes:")
-	any := false
-	for _, m := range mods {
-		ch, err := rewriteGoMod(m, prefix, pathToKey, verOf, false)
-		if err != nil {
-			return err
+	// -mod=mod lets tidy rewrite go.mod/go.sum from the published dependencies.
+	env := []string{"GOFLAGS=-mod=mod"}
+	for _, m := range ready {
+		if _, err := rewriteGoMod(m, prefix, pathToKey, verOf, true); err != nil {
+			return c.abort(err)
 		}
-		for _, line := range ch {
-			cligo.Echo("  %s/go.mod: %s", m.Key, line)
-			any = true
-		}
-	}
-	if !any {
-		cligo.Echo("  (none)")
-	}
-
-	cligo.Echo("")
-	cligo.Echo("go.sum changes:")
-	any = false
-	for _, m := range mods {
+		// Force each in-repo dependency to be re-fetched from the origin so tidy
+		// records its real published checksum, not a stale go.sum line or a cache
+		// entry an earlier bad release may have poisoned.
 		for _, depKey := range m.Deps {
-			dep := keyToMod[depKey]
-			zipH, _, err := moduleHashes(dep.Path, verOf(depKey), dep.Dir)
-			if err != nil {
-				return fmt.Errorf("hash %s: %w", dep.Path, err)
-			}
-			note := ""
-			if len(dep.Deps) > 0 {
-				note = "  (approx: dependency is itself re-pinned)"
-			}
-			cligo.Echo("  %s/go.sum: %s %s %s%s", m.Key, dep.Path, verOf(depKey), zipH, note)
-			any = true
+			freshenDep(m.Dir, keyToMod[depKey].Path, verOf(depKey))
 		}
 	}
-	if !any {
-		cligo.Echo("  (none)")
+	for _, m := range ready {
+		if _, err := goCmd(m.Dir, env, "mod", "tidy"); err != nil {
+			return c.abort(fmt.Errorf("go mod tidy in %q failed — is every in-repo dependency "+
+				"from the previous phase pushed and published?\n%w", m.Key, err))
+		}
+		if _, err := goCmd(m.Dir, env, "build", "./..."); err != nil {
+			return c.abort(fmt.Errorf("go build in %q failed:\n%w", m.Key, err))
+		}
+		cligo.Echo("  %-26s tidied + built", m.Key)
 	}
-	cligo.Echo("")
-	cligo.Echo("dry run: nothing committed or tagged")
+
+	if err := commitIfChanged(c.Version); err != nil {
+		return err
+	}
+	created, err := tagAll(ready, verOf)
+	if err != nil {
+		return err
+	}
+
+	c.printNext(created, branch, pending)
 	return nil
 }
 
-// releaseOffline pins every go.mod, computes the in-repo go.sum checksums locally
-// (no proxy), commits once, then tags every module.
-func (c *ReleaseCmd) releaseOffline(mods []Module, prefix string, pathToKey map[string]string, keyToMod map[string]Module, verOf func(string) string, branch string) error {
+// splitReady partitions the not-yet-released modules into those whose in-repo
+// dependencies are all already tagged at the release version (ready: this phase)
+// and those still waiting on a dependency (pending: a later phase). Modules
+// already tagged at the version are skipped entirely.
+func splitReady(mods []Module, verOf func(string) string) (ready, pending []Module) {
+	released := make(map[string]bool, len(mods))
 	for _, m := range mods {
-		if _, err := rewriteGoMod(m, prefix, pathToKey, verOf, true); err != nil {
-			return err
+		if tagExists(m.Tag(verOf(m.Key))) {
+			released[m.Key] = true
 		}
 	}
-	// go.mods are now pinned; hash each dependency from its updated working tree.
 	for _, m := range mods {
-		for _, depKey := range m.Deps {
-			dep := keyToMod[depKey]
-			zipH, modH, err := moduleHashes(dep.Path, verOf(depKey), dep.Dir)
-			if err != nil {
-				return fmt.Errorf("hash %s: %w", dep.Path, err)
-			}
-			changed, err := writeGoSum(m.Dir, dep.Path, verOf(depKey), zipH, modH)
-			if err != nil {
-				return err
-			}
-			if changed {
-				cligo.Echo("  %s/go.sum: %s %s", m.Key, dep.Path, verOf(depKey))
-			}
-		}
-	}
-
-	if err := commitIfChanged(c.Version); err != nil {
-		return err
-	}
-
-	created, err := tagAll(mods, verOf)
-	if err != nil {
-		return err
-	}
-	return c.finishRelease(created, branch)
-}
-
-// releaseOnline pins every go.mod, then lets the go toolchain be authoritative:
-// it serves every releasing module to the toolchain from a temporary local proxy
-// (so no tag needs to be pushed to resolve it) and, in dependency order, updates
-// each dependent with 'go get'/'go mod tidy', builds it, and verifies its go.sum.
-// Everything is then committed once and tagged. Nothing is pushed.
-func (c *ReleaseCmd) releaseOnline(mods []Module, prefix string, pathToKey map[string]string, keyToMod map[string]Module, verOf func(string) string, branch string) error {
-	for _, m := range mods {
-		if _, err := rewriteGoMod(m, prefix, pathToKey, verOf, true); err != nil {
-			return err
-		}
-	}
-
-	proxyDir, err := buildLocalProxy(mods, verOf)
-	if err != nil {
-		return fmt.Errorf("build local proxy: %w", err)
-	}
-	defer os.RemoveAll(proxyDir)
-	env := proxyEnv(proxyDir)
-
-	for _, m := range mods {
-		if len(m.Deps) == 0 {
+		if released[m.Key] {
 			continue
 		}
-		for _, depKey := range m.Deps {
-			dep := keyToMod[depKey]
-			if _, err := goCmd(m.Dir, env, "get", dep.Path+"@"+verOf(depKey)); err != nil {
-				return err
+		blocked := false
+		for _, d := range m.Deps {
+			if !released[d] {
+				blocked = true
+				break
 			}
 		}
-		if _, err := goCmd(m.Dir, env, "mod", "tidy"); err != nil {
-			return err
+		if blocked {
+			pending = append(pending, m)
+		} else {
+			ready = append(ready, m)
 		}
-		if _, err := goCmd(m.Dir, env, "build", "./..."); err != nil {
-			return err
-		}
-		if _, err := goCmd(m.Dir, env, "mod", "verify"); err != nil {
-			return err
-		}
-		cligo.Echo("  %s: go.sum updated, built, and verified", m.Key)
 	}
-
-	if err := commitIfChanged(c.Version); err != nil {
-		return err
-	}
-	created, err := tagAll(mods, verOf)
-	if err != nil {
-		return err
-	}
-	return c.finishRelease(created, branch)
+	return ready, pending
 }
 
-// tagAll creates every missing tag (skipping existing ones) and returns the tags
-// it created.
+// abort undoes this phase's uncommitted go.mod/go.sum edits (best effort) so a
+// failed phase leaves a clean tree to retry from, and returns the original error.
+func (c *ReleaseCmd) abort(err error) error {
+	_, _ = git("checkout", "--", ".")
+	return err
+}
+
+// printNext reports what this phase tagged and prints the push command plus the
+// command to run the next phase (or that the release is complete).
+func (c *ReleaseCmd) printNext(created []string, branch string, pending []Module) {
+	cligo.Echo("")
+	if len(created) == 0 {
+		cligo.Echo("no new tags created this phase.")
+	} else {
+		cligo.Echo("phase complete — tagged %s locally on %q (nothing pushed).",
+			strings.Join(created, ", "), branch)
+	}
+	cligo.Echo("")
+	cligo.Echo("Next steps:")
+	step := 1
+	if len(created) > 0 {
+		cligo.Echo("  %d. Publish this phase (push the branch and its tags):", step)
+		cligo.Echo("       git push origin %s && git push origin %s", branch, strings.Join(created, " "))
+		step++
+	}
+	if len(pending) > 0 {
+		cligo.Echo("  %d. Once those tags are published, run the next phase:", step)
+		cligo.Echo("       %s", c.invocation())
+		cligo.Echo("")
+		cligo.Echo("still waiting (need this phase's tags first): %s", keysOf(pending))
+	} else {
+		cligo.Echo("  After pushing, the release is complete.")
+	}
+}
+
+// invocation reproduces the command to run the next phase, preserving any --bump
+// overrides so each phase pins the same per-module versions.
+func (c *ReleaseCmd) invocation() string {
+	parts := []string{"gorel release", c.Version}
+	for _, b := range c.Bump {
+		parts = append(parts, "-b "+b)
+	}
+	return strings.Join(parts, " ")
+}
+
+// planDryRun prints the full phased plan: each topological layer is one phase,
+// released and pushed before the next.
+func (c *ReleaseCmd) planDryRun(mods []Module, verOf func(string) string) error {
+	layers := topoLayers(mods)
+	cligo.Echo("Phased release plan for %s — %d phase(s), push between each:", c.Version, len(layers))
+	for i, layer := range layers {
+		cligo.Echo("")
+		cligo.Echo("  Phase %d:", i+1)
+		for _, m := range layer {
+			suffix := ""
+			if len(m.Deps) > 0 {
+				suffix = "  (requires " + strings.Join(m.Deps, ", ") + ")"
+			}
+			if tagExists(m.Tag(verOf(m.Key))) {
+				suffix += "  [already tagged]"
+			}
+			cligo.Echo("    %-26s -> %s%s", m.Key, m.Tag(verOf(m.Key)), suffix)
+		}
+	}
+	cligo.Echo("")
+	cligo.Echo("Each phase pins in-repo requires, runs 'go mod tidy' + 'go build', commits, and")
+	cligo.Echo("tags; you push, then run gorel again for the next phase. No checksums are")
+	cligo.Echo("computed by gorel — go.sum comes from 'go mod tidy' against the published deps.")
+	return nil
+}
+
+// topoLayers groups modules by dependency depth: layer 0 has no in-repo deps,
+// layer n requires only modules in layers < n. Each layer is one release phase.
+// Input is assumed acyclic (topoSort has already rejected cycles).
+func topoLayers(mods []Module) [][]Module {
+	byKey := make(map[string]Module, len(mods))
+	for _, m := range mods {
+		byKey[m.Key] = m
+	}
+	depth := make(map[string]int, len(mods))
+	var d func(key string) int
+	d = func(key string) int {
+		if v, ok := depth[key]; ok {
+			return v
+		}
+		max := -1
+		for _, dep := range byKey[key].Deps {
+			if dd := d(dep); dd > max {
+				max = dd
+			}
+		}
+		depth[key] = max + 1
+		return depth[key]
+	}
+	maxDepth := 0
+	for _, m := range mods {
+		if dd := d(m.Key); dd > maxDepth {
+			maxDepth = dd
+		}
+	}
+	layers := make([][]Module, maxDepth+1)
+	for _, m := range mods { // mods is topo-sorted, so order within a layer is stable
+		layers[depth[m.Key]] = append(layers[depth[m.Key]], m)
+	}
+	return layers
+}
+
+// keysOf joins module keys for display.
+func keysOf(mods []Module) string {
+	ks := make([]string, len(mods))
+	for i, m := range mods {
+		ks[i] = m.Key
+	}
+	return strings.Join(ks, ", ")
+}
+
+// tagAll creates every missing tag for the given modules (skipping existing ones)
+// and returns the tags it created.
 func tagAll(mods []Module, verOf func(string) string) ([]string, error) {
 	var created []string
 	for _, m := range mods {
@@ -299,30 +322,15 @@ func tagAll(mods []Module, verOf func(string) string) ([]string, error) {
 	return created, nil
 }
 
-// finishRelease reports what was created locally and prints the command to
-// publish it. gorel deliberately does not push: tagging is the tool's job,
-// pushing is the operator's.
-func (c *ReleaseCmd) finishRelease(created []string, branch string) error {
-	if len(created) == 0 {
-		cligo.Echo("no new tags to create; nothing to release")
-		return nil
-	}
-	cligo.Echo("")
-	cligo.Echo("created %d tag(s) locally on %q; nothing pushed.", len(created), branch)
-	cligo.Echo("publish with:")
-	cligo.Echo("  git push origin %s && git push origin %s", branch, strings.Join(created, " "))
-	return nil
-}
-
 // commitIfChanged stages everything and commits only when there is something to
-// commit (the go.mod rewrites may be a no-op for an already-released repo).
+// commit (a phase whose go.mod/go.sum were already current is a no-op).
 func commitIfChanged(version string) error {
 	if _, err := git("add", "-A"); err != nil {
 		return err
 	}
 	// `git diff --cached --quiet` exits 0 when nothing is staged, non-zero otherwise.
 	if _, err := git("diff", "--cached", "--quiet"); err == nil {
-		cligo.Echo("no go.mod changes to commit; tagging current HEAD")
+		cligo.Echo("no go.mod/go.sum changes to commit; tagging current HEAD")
 		return nil
 	}
 	_, err := git("commit", "-m", "release "+version)

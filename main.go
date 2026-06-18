@@ -19,12 +19,15 @@ var (
 
 const appHelp = `gorel — coordinated releases for multi-module Go repositories.
 
-One shared version moves every module in the repo; a single module can take a
-higher patch via --bump. The module prefix is auto-detected from go.mod, so the
-same binary works in every repo, and re-runs only add the tags that are missing.
+One shared version moves every module in the repo, released in dependency phases:
+each run tags the modules whose in-repo deps are already published, then you push
+and run it again for the next phase. go.sum is produced by 'go mod tidy' pulling
+the published deps — gorel computes no checksums itself. A single module can take a
+higher patch via --bump; the module prefix is auto-detected from go.mod.
 
-  gorel release v1.3.0               tag every module at v1.3.0
+  gorel release v1.3.0               release the next ready dependency phase
   gorel release v1.3.0 -b grpc=v1.3.1   bump grpc to v1.3.1, the rest at v1.3.0
+  gorel release v1.3.0 --dry-run     print the full phase plan, change nothing
   gorel list                         show each module's latest released version
   gorel repair                       repair go.sum against the published deps
 

@@ -186,6 +186,27 @@ func parseModule(goMod string) (path string, requires []string, err error) {
 	return f.Module.Mod.Path, requires, nil
 }
 
+// inRepoRequires returns the in-repo modules that the module in dir requires,
+// as depPath -> required version, using pathToKey to recognise in-repo paths.
+func inRepoRequires(dir string, pathToKey map[string]string) (map[string]string, error) {
+	p := filepath.Join(dir, "go.mod")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	f, err := modfile.Parse(p, data, nil)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	out := map[string]string{}
+	for _, r := range f.Require {
+		if _, ok := pathToKey[r.Mod.Path]; ok {
+			out[r.Mod.Path] = r.Mod.Version
+		}
+	}
+	return out, nil
+}
+
 // rewriteGoMod strips bootstrap replace directives that point at internal modules
 // and pins internal require versions to the release. It returns a human-readable
 // list of the changes it would make; with apply=true it also writes the file.
