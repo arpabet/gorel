@@ -26,6 +26,7 @@ same binary works in every repo, and re-runs only add the tags that are missing.
   gorel release v1.3.0               tag every module at v1.3.0
   gorel release v1.3.0 -b grpc=v1.3.1   bump grpc to v1.3.1, the rest at v1.3.0
   gorel list                         show each module's latest released version
+  gorel refresh                      repair go.sum against the published deps
 
 Run it anywhere inside the target repository.`
 
@@ -39,6 +40,7 @@ func main() {
 		cligo.Beans(
 			&ReleaseCmd{},
 			&ListCmd{},
+			&RefreshCmd{},
 		),
 	)
 }

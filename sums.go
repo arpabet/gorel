@@ -38,7 +38,7 @@ func moduleHashes(path, version, dir string) (zipHash, modHash string, err error
 	}
 	defer os.Remove(zf.Name())
 	mv := module.Version{Path: path, Version: version}
-	if err := modzip.CreateFromDir(zf, mv, dir); err != nil {
+	if err := moduleZip(zf, mv, dir); err != nil {
 		zf.Close()
 		return "", "", fmt.Errorf("zip %s@%s from %s: %w", path, version, dir, err)
 	}
@@ -56,6 +56,89 @@ func moduleHashes(path, version, dir string) (zipHash, modHash string, err error
 		return os.Open(goMod)
 	})
 	return zipHash, modHash, err
+}
+
+// moduleZip writes the module zip for mv to w, containing exactly the files git
+// would commit from dir (tracked + new, minus ignored) — matching what the proxy
+// serves from the eventual tag. Hashing the raw working tree with CreateFromDir
+// instead folds in git-ignored junk (.idea/, .claude/, local scratch files), so
+// the checksum verifies locally but mismatches the proxy downstream: that is the
+// value-rpc v1.4.0 release bug. CreateFromDir over the staged tree still applies
+// the module-zip rules, so nested modules and vendor dirs git happens to list are
+// dropped here. Outside a git work tree (unit tests) it falls back to the raw dir.
+func moduleZip(w io.Writer, mv module.Version, dir string) error {
+	files, ok, err := gitCommitFiles(dir)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return modzip.CreateFromDir(w, mv, dir)
+	}
+	stage, err := os.MkdirTemp("", "gorel-stage-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	for _, rel := range files {
+		if err := copyForZip(filepath.Join(dir, rel), filepath.Join(stage, rel)); err != nil {
+			return err
+		}
+	}
+	return modzip.CreateFromDir(w, mv, stage)
+}
+
+// gitCommitFiles lists, relative to dir, the files git would include in a commit
+// of dir — tracked files plus new non-ignored files, with the working-tree
+// content. ok is false when dir is not inside a git work tree, signalling the
+// caller to fall back to hashing the directory as-is.
+func gitCommitFiles(dir string) (files []string, ok bool, err error) {
+	if exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree").Run() != nil {
+		return nil, false, nil
+	}
+	out, err := exec.Command("git", "-C", dir, "ls-files", "--cached", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			files = append(files, p)
+		}
+	}
+	return files, true, nil
+}
+
+// copyForZip copies the regular file src to dst (creating parents), mirroring how
+// module zips treat the tree: a tracked-but-deleted file (gone from the working
+// tree) is skipped, as it would be from the commit, and symlinks/irregular files
+// are omitted just as modzip omits them.
+func copyForZip(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // writeGoSum updates dir/go.sum so that depPath is recorded at exactly version
@@ -171,7 +254,7 @@ func buildLocalProxy(mods []Module, verOf func(string) string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := modzip.CreateFromDir(zf, module.Version{Path: m.Path, Version: ver}, m.Dir); err != nil {
+		if err := moduleZip(zf, module.Version{Path: m.Path, Version: ver}, m.Dir); err != nil {
 			zf.Close()
 			return "", err
 		}

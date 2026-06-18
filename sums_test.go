@@ -8,6 +8,7 @@ package main
 import (
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +75,64 @@ func TestModuleHashesZipCrossCheck(t *testing.T) {
 	}
 	if zipHash != want {
 		t.Errorf("zip hash = %q, want %q (HashDir)", zipHash, want)
+	}
+}
+
+// TestModuleHashesExcludesIgnoredJunk guards the value-rpc v1.4.0 release bug:
+// hashing the raw working tree folds git-ignored files (.idea/, local scratch
+// files) into the module zip, so the checksum verifies locally but mismatches the
+// proxy — which serves only git-tracked content — and fails downstream. moduleZip
+// must hash git's committable view, so ignored files do not change the hash.
+func TestModuleHashesExcludesIgnoredJunk(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	const path, version = "go.arpabet.com/obfs/tlscamo", "v0.2.0"
+	writeMod(t, dir, path)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}} {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	clean, _, err := moduleHashes(path, version, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An ignored file appears in the working tree but not in any commit.
+	if err := os.WriteFile(filepath.Join(dir, "junk"), []byte("scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withJunk, _, err := moduleHashes(path, version, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withJunk != clean {
+		t.Errorf("ignored file changed the hash: %q != %q", withJunk, clean)
+	}
+
+	// Sanity-check the guard: the same junk file in a non-git dir (raw CreateFromDir
+	// fallback) does change the hash, proving the git filtering is what excludes it.
+	raw := t.TempDir()
+	writeMod(t, raw, path)
+	if err := os.WriteFile(filepath.Join(raw, ".gitignore"), []byte("junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(raw, "junk"), []byte("scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rawHash, _, err := moduleHashes(path, version, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rawHash == clean {
+		t.Fatal("test is not exercising junk exclusion: raw hash matches clean hash")
 	}
 }
 
