@@ -20,6 +20,8 @@ edits (no fragile regex) and `git` for tagging.
   version.
 - **Safe**: `--dry-run` previews everything (including `go.sum` changes). gorel
   **never pushes** — it tags locally and prints the `git push` for you to run.
+- **Self-repairing**: `gorel refresh` rebuilds each module's `go.sum` from the
+  published modules when a checksum goes stale or wrong.
 
 ## Installation
 
@@ -64,6 +66,7 @@ go.arpabet.com/servion  —  3 module(s)
 |---------|---------|
 | `gorel release <version> [--bump m=v]… [--dry-run] [--offline]` | Tag a coordinated release of every module, in dependency order. |
 | `gorel list [--fetch]` | Show each module and its latest released version (a quick look). |
+| `gorel refresh [--dry-run]` | Repair every module's `go.sum` against its **published** dependencies. |
 
 By default the go toolchain is authoritative for `go.sum`: every releasing module
 is served to `go get`/`go mod tidy` from a temporary local proxy (so no tag needs
@@ -137,6 +140,40 @@ dry run: nothing committed or tagged
 
 After a real release gorel prints the `git push` to publish the branch and tags;
 run it yourself when you are ready.
+
+### Repair a stale or wrong `go.sum`
+
+If a build fails with a checksum mismatch on an in-repo dependency —
+
+```
+verifying go.arpabet.com/value-rpc@v1.4.0: checksum mismatch
+  downloaded: h1:d0ij…
+  go.sum:     h1:TY5b…
+SECURITY ERROR
+```
+
+— the recorded checksum no longer matches what the proxy serves. `gorel refresh`
+runs `go mod tidy` in every module so `go.sum` is recomputed from the **published**
+modules, dropping and regenerating a `go.sum` that holds a conflicting hash:
+
+```bash
+gorel refresh             # tidy every module, rewriting go.sum where needed
+gorel refresh --dry-run   # report what would change, then restore the files
+```
+
+```
+module prefix: go.arpabet.com/value-rpc
+  .                          up to date
+  quic                       updated
+  resilience                 updated
+
+go.sum refreshed; review and commit the changes.
+```
+
+Every in-repo dependency must already be tagged **and pushed** so the proxy can
+serve it — `refresh` is a post-release repair, not part of releasing. Like
+`release`, it never commits or pushes; review the working-tree changes and commit
+them yourself.
 
 ## What it does, in order
 
