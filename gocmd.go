@@ -6,10 +6,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/xerrors"
 )
 
 // goCmd runs `go args...` in dir with GOWORK=off (so a stray go.work does not
@@ -22,7 +23,7 @@ func goCmd(dir string, extraEnv []string, args ...string) (string, error) {
 	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out), fmt.Errorf("go %s (in %s): %v\n%s",
+		return string(out), xerrors.Errorf("go %s (in %s): %v\n%s",
 			strings.Join(args, " "), dir, err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil

@@ -7,10 +7,10 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"go.arpabet.com/cligo"
+	"golang.org/x/xerrors"
 )
 
 // ReleaseCmd implements `gorel release`.
@@ -74,7 +74,7 @@ func (c *ReleaseCmd) Run(ctx context.Context) error {
 	}
 	for k := range overrides {
 		if _, ok := keyToMod[k]; !ok {
-			return fmt.Errorf("--bump %s: no module with that subdir in this repo (see `gorel list`)", k)
+			return xerrors.Errorf("--bump %s: no module with that subdir in this repo (see `gorel list`)", k)
 		}
 	}
 	verOf := func(key string) string {
@@ -102,7 +102,7 @@ func (c *ReleaseCmd) Run(ctx context.Context) error {
 		return err
 	}
 	if !clean {
-		return fmt.Errorf("working tree is dirty; commit or stash first")
+		return xerrors.Errorf("working tree is dirty; commit or stash first")
 	}
 	branch, err := currentBranch()
 	if err != nil {
@@ -135,11 +135,11 @@ func (c *ReleaseCmd) Run(ctx context.Context) error {
 	}
 	for _, m := range ready {
 		if _, err := goCmd(m.Dir, env, "mod", "tidy"); err != nil {
-			return c.abort(fmt.Errorf("go mod tidy in %q failed — is every in-repo dependency "+
+			return c.abort(xerrors.Errorf("go mod tidy in %q failed — is every in-repo dependency "+
 				"from the previous phase pushed and published?\n%w", m.Key, err))
 		}
 		if _, err := goCmd(m.Dir, env, "build", "./..."); err != nil {
-			return c.abort(fmt.Errorf("go build in %q failed:\n%w", m.Key, err))
+			return c.abort(xerrors.Errorf("go build in %q failed:\n%w", m.Key, err))
 		}
 		cligo.Echo("  %-26s tidied + built", m.Key)
 	}

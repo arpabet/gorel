@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
+	"golang.org/x/xerrors"
 )
 
 // Module is one releasable Go module in the repository.
@@ -41,7 +42,7 @@ func (m Module) Tag(v string) string {
 func loadRepo() (prefix string, mods []Module, err error) {
 	root, err := git("rev-parse", "--show-toplevel")
 	if err != nil {
-		return "", nil, fmt.Errorf("not inside a git repository: %w", err)
+		return "", nil, xerrors.Errorf("not inside a git repository: %w", err)
 	}
 	if err := os.Chdir(root); err != nil {
 		return "", nil, err
@@ -78,7 +79,7 @@ func discoverModules(root string) (prefix string, mods []Module, err error) {
 		return "", nil, err
 	}
 	if len(keys) == 0 {
-		return "", nil, fmt.Errorf("no go.mod modules found under %s", root)
+		return "", nil, xerrors.Errorf("no go.mod modules found under %s", root)
 	}
 	sort.Strings(keys) // "." sorts before any subdir, so the root comes first
 
@@ -135,7 +136,7 @@ func topoSort(mods []Module) ([]Module, error) {
 		case done:
 			return nil
 		case visiting:
-			return fmt.Errorf("dependency cycle involving module %q", m.Key)
+			return xerrors.Errorf("dependency cycle involving module %q", m.Key)
 		}
 		state[m.Key] = visiting
 		for _, dk := range m.Deps { // Deps is sorted, so traversal is deterministic
@@ -175,10 +176,10 @@ func parseModule(goMod string) (path string, requires []string, err error) {
 	}
 	f, err := modfile.Parse(goMod, data, nil)
 	if err != nil {
-		return "", nil, fmt.Errorf("parse %s: %w", goMod, err)
+		return "", nil, xerrors.Errorf("parse %s: %w", goMod, err)
 	}
 	if f.Module == nil {
-		return "", nil, fmt.Errorf("%s has no module directive", goMod)
+		return "", nil, xerrors.Errorf("%s has no module directive", goMod)
 	}
 	for _, r := range f.Require {
 		requires = append(requires, r.Mod.Path)
@@ -196,7 +197,7 @@ func inRepoRequires(dir string, pathToKey map[string]string) (map[string]string,
 	}
 	f, err := modfile.Parse(p, data, nil)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", p, err)
+		return nil, xerrors.Errorf("parse %s: %w", p, err)
 	}
 	out := map[string]string{}
 	for _, r := range f.Require {
@@ -218,7 +219,7 @@ func rewriteGoMod(m Module, prefix string, pathToKey map[string]string, verOf fu
 	}
 	f, err := modfile.Parse(p, data, nil)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", p, err)
+		return nil, xerrors.Errorf("parse %s: %w", p, err)
 	}
 
 	var drop []*modfile.Replace
@@ -270,10 +271,10 @@ func rewriteGoMod(m Module, prefix string, pathToKey map[string]string, verOf fu
 // validVersion reports whether v is a 3-component semver tag (vX.Y.Z[-pre]).
 func validVersion(v string) error {
 	if fourPart(v) {
-		return fmt.Errorf("%q has four numbers; Go requires vX.Y.Z — bump a single module with --bump", v)
+		return xerrors.Errorf("%q has four numbers; Go requires vX.Y.Z — bump a single module with --bump", v)
 	}
 	if !semver.IsValid(v) {
-		return fmt.Errorf("%q is not valid semver (expected vMAJOR.MINOR.PATCH)", v)
+		return xerrors.Errorf("%q is not valid semver (expected vMAJOR.MINOR.PATCH)", v)
 	}
 	return nil
 }
@@ -293,10 +294,10 @@ func parseBumps(bumps []string) (map[string]string, error) {
 	for _, b := range bumps {
 		k, v, ok := strings.Cut(b, "=")
 		if !ok || k == "" || v == "" {
-			return nil, fmt.Errorf("invalid --bump %q, expected module=version (e.g. grpc=v1.2.3)", b)
+			return nil, xerrors.Errorf("invalid --bump %q, expected module=version (e.g. grpc=v1.2.3)", b)
 		}
 		if err := validVersion(v); err != nil {
-			return nil, fmt.Errorf("--bump %q: %w", b, err)
+			return nil, xerrors.Errorf("--bump %q: %w", b, err)
 		}
 		out[k] = v
 	}
@@ -352,7 +353,7 @@ func git(args ...string) (string, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+		return "", xerrors.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
